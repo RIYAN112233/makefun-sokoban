@@ -1,203 +1,60 @@
-// Push-optimal Sokoban solver, compact edition: rooms split along the hallway, each solved by BFS over pushes.
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-const IN = process.env.MAKEFUN_INPUT_DIR ?? "/input", OUT = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
-const DR = [[0, -1, "u"], [0, 1, "d"], [-1, 0, "l"], [1, 0, "r"]];
-
-function parse(text) {
-  const rows = text.split("\n").filter(r => r.length);
-  const h = rows.length, w = Math.max(...rows.map(r => r.length)), n = w * h;
-  const wall = new Uint8Array(n).fill(1), goals = [], boxes = [];
-  let player = -1;
-  rows.forEach((row, y) => {
-    for (let x = 0; x < row.length; x++) {
-      const c = row[x], i = y * w + x;
-      if (c === "#") continue;
-      wall[i] = 0;
-      if (".*+".includes(c)) goals.push(i);
-      if ("$*".includes(c)) boxes.push(i);
-      if ("@+".includes(c)) player = i;
-    }
-  });
-  for (let x = 0; x < w; x++) wall[x] = wall[(h - 1) * w + x] = 1;
-  for (let y = 0; y < h; y++) wall[y * w] = wall[y * w + w - 1] = 1;
-  return { w, wall, goals, boxes: boxes.sort((a, b) => a - b), player };
-}
-
-// Squares from which one box alone can be pushed onto some goal, pulled back from the goals.
-function live(w, wall, goals) {
-  const lv = new Uint8Array(wall.length), q = [];
-  for (const g of goals) { lv[g] = 1; q.push(g); }
-  for (let i = 0; i < q.length; i++) {
-    const x = q[i];
-    for (const [dx, dy] of DR) {
-      const d = dy * w + dx, y = x - d;
-      if (!wall[y] && !wall[y - d] && !lv[y]) { lv[y] = 1; q.push(y); }
-    }
-  }
-  return lv;
-}
-
-// Flood the player's region around the boxes; stamp it into seen and return its lowest square.
-function reach(w, wall, occ, from, seen, stamp) {
-  let low = from;
-  const st = [from];
-  seen[from] = stamp;
-  while (st.length) {
-    const p = st.pop();
-    if (p < low) low = p;
-    for (const o of [-w, w, -1, 1]) {
-      const q = p + o;
-      if (!wall[q] && !occ[q] && seen[q] !== stamp) { seen[q] = stamp; st.push(q); }
-    }
-  }
-  return low;
-}
-
-// True when the box pushed to t completes a 2x2 block of walls/boxes with a box off its goal.
-function frozen(w, wall, occ, goal, t) {
-  for (const a of [t, t - 1, t - w, t - w - 1]) {
-    const b = a + 1, c = a + w, d = c + 1;
-    if ((wall[a] || occ[a]) && (wall[b] || occ[b]) && (wall[c] || occ[c]) && (wall[d] || occ[d]) &&
-      ((occ[a] && !goal[a]) || (occ[b] && !goal[b]) || (occ[c] && !goal[c]) || (occ[d] && !goal[d]))) return true;
-  }
-  return false;
-}
-
-// The player's shortest walk from one square to another around walls and boxes.
-function walk(w, wall, occ, from, to) {
-  if (from === to) return "";
-  const prev = new Int32Array(wall.length).fill(-1), how = [], q = [from];
-  prev[from] = from;
-  for (let i = 0; i < q.length; i++) {
-    const p = q[i];
-    if (p === to) break;
-    for (const [dx, dy, ch] of DR) {
-      const s = p + dy * w + dx;
-      if (wall[s] || occ[s] || prev[s] !== -1) continue;
-      prev[s] = p; how[s] = ch; q.push(s);
-    }
-  }
-  let s = "";
-  for (let p = to; p !== from; p = prev[p]) s = how[p] + s;
-  return s;
-}
-
-// BFS over pushes for one (sub)level: {moves, player} at the push optimum, or null. A state is the
-// sorted boxes plus the player region's lowest square; dead squares and frozen blocks prune.
-function solve(w, wall, goals, boxes0, player0) {
-  const n = wall.length, goal = new Uint8Array(n);
-  for (const g of goals) goal[g] = 1;
-  const lv = live(w, wall, goals);
-  if (boxes0.some(b => !lv[b])) return null;
-  const occ = new Uint8Array(n), seen = new Int32Array(n), mk = new Int32Array(n);
-  let stamp = 0;
-  const key = (bs, low) => String.fromCharCode(low, ...bs);
-  const SB = [boxes0], SP = [player0], PA = [-1], idx = new Map();
-  const done = bs => bs.every(b => goal[b]);
-  for (const b of boxes0) occ[b] = 1;
-  idx.set(key(boxes0, reach(w, wall, occ, player0, seen, ++stamp)), 0);
-  for (const b of boxes0) occ[b] = 0;
-  let found = done(boxes0) ? 0 : -1;
-  for (let head = 0; found < 0 && head < SB.length; head++) {
-    const boxes = SB[head];
-    for (const b of boxes) occ[b] = 1;
-    reach(w, wall, occ, SP[head], seen, ++stamp);
-    const here = stamp;
-    for (let bi = 0; bi < boxes.length; bi++) {
-      const b = boxes[bi];
-      for (const [dx, dy] of DR) {
-        if (found >= 0) break;
-        const d = dy * w + dx, t = b + d;
-        if (seen[b - d] !== here || wall[t] || occ[t] || !lv[t]) continue;
-        occ[b] = 0; occ[t] = 1;
-        let nx = null, k = "";
-        if (!frozen(w, wall, occ, goal, t)) {
-          nx = boxes.slice(); nx[bi] = t; nx.sort((x, y) => x - y);
-          k = key(nx, reach(w, wall, occ, b, mk, ++stamp));
-        }
-        occ[t] = 0; occ[b] = 1;
-        if (!nx || idx.has(k)) continue;
-        idx.set(k, SB.length); SB.push(nx); SP.push(b); PA.push(head);
-        if (done(nx)) found = SB.length - 1;
-      }
-      if (found >= 0) break;
-    }
-    for (const b of boxes) occ[b] = 0;
-  }
-  if (found < 0) return null;
-  const path = [];
-  for (let s = found; s > 0; s = PA[s]) path.push(s);
-  path.reverse();
-  let moves = "", player = player0, boxes = boxes0;
-  for (const s of path) {
-    const nb = SB[s];
-    const from = boxes.find(b => !nb.includes(b)), to = nb.find(b => !boxes.includes(b));
-    const d = to - from, dir = DR.find(([dx, dy]) => dy * w + dx === d);
-    for (const b of boxes) occ[b] = 1;
-    moves += walk(w, wall, occ, player, from - d);
-    for (const b of boxes) occ[b] = 0;
-    moves += dir[2];
-    player = from; boxes = nb;
-  }
-  return { moves, player };
-}
-
-// Rooms: cut the dead squares of the player's row (the hallway) out of the floor; each part left with
-// boxes is a room. Null when a box starts in the hallway, a goal is in no part, or counts disagree.
-function roomsOf(L) {
-  const { w, wall, goals, boxes, player } = L, n = wall.length;
-  const lv = live(w, wall, goals), row = (player / w) | 0, cut = new Uint8Array(n);
-  for (let i = row * w; i < (row + 1) * w; i++) if (!wall[i] && !lv[i]) cut[i] = 1;
-  if (boxes.some(b => cut[b])) return null;
-  const part = new Int32Array(n).fill(-1), comps = [];
-  for (let s = 0; s < n; s++) {
-    if (wall[s] || cut[s] || part[s] >= 0) continue;
-    const cells = [s];
-    part[s] = comps.length;
-    for (let i = 0; i < cells.length; i++) {
-      for (const [dx, dy] of DR) {
-        const q = cells[i] + dy * w + dx;
-        if (!wall[q] && !cut[q] && part[q] < 0) { part[q] = comps.length; cells.push(q); }
-      }
-    }
-    comps.push({ boxes: [], goals: [] });
-  }
-  for (const b of boxes) comps[part[b]].boxes.push(b);
-  for (const g of goals) {
-    if (part[g] < 0) return null;
-    comps[part[g]].goals.push(g);
-  }
-  if (comps.some(c => c.boxes.length !== c.goals.length)) return null;
-  return comps.filter(c => c.boxes.length);
-}
-
-// Solve room by room: other rooms' boxes stand as walls (on their goals once done), the player walks
-// on from where the last room left it. A box leaving its room lands dead, so the optima simply add.
-function solveLevel(L) {
-  const rooms = roomsOf(L);
-  if (!rooms) {
-    const r = solve(L.w, L.wall, L.goals, L.boxes, L.player);
-    return r ? r.moves : "";
-  }
-  let player = L.player, moves = "";
-  const dn = rooms.map(() => false);
-  for (let ri = 0; ri < rooms.length; ri++) {
-    const wall = L.wall.slice();
-    rooms.forEach((o, oi) => {
-      if (oi !== ri) for (const b of dn[oi] ? o.goals : o.boxes) wall[b] = 1;
-    });
-    const r = solve(L.w, wall, rooms[ri].goals, rooms[ri].boxes, player);
-    if (!r) return "";
-    moves += r.moves;
-    player = r.player;
-    dn[ri] = true;
-  }
-  return moves;
-}
-
-for (const id of readdirSync(IN).sort()) {
-  const moves = solveLevel(parse(readFileSync(join(IN, id, "level.txt"), "utf8")));
-  mkdirSync(join(OUT, id), { recursive: true });
-  writeFileSync(join(OUT, id, "solution.txt"), moves + "\n");
-}
+import{mkdirSync,readdirSync,readFileSync,writeFileSync}from"node:fs";
+const I=process.env.MAKEFUN_INPUT_DIR??"/input",O=process.env.MAKEFUN_OUTPUT_DIR??"/output",C="udlr";
+let D;
+const P=t=>{const r=t.split("\n").filter(x=>x.length),h=r.length,w=Math.max(...r.map(x=>x.length)),n=w*h,W=new Uint8Array(n).fill(1),G=[],B=[];let p=-1;D=[-w,w,-1,1];
+r.forEach((s,y)=>{for(let x=0;x<s.length;x++){const c=s[x],i=y*w+x;if(c!="#"){W[i]=0;if(".*+".includes(c))G.push(i);if("$*".includes(c))B.push(i);if("@+".includes(c))p=i}}});
+for(let x=0;x<w;x++)W[x]=W[(h-1)*w+x]=1;
+for(let y=0;y<h;y++)W[y*w]=W[y*w+w-1]=1;
+return{w,W,G,B:B.sort((a,b)=>a-b),p}};
+const V=(w,W,G)=>{const v=new Uint8Array(W.length),q=[];for(const g of G){v[g]=1;q.push(g)}
+for(let i=0;i<q.length;i++){const x=q[i];for(const d of D){const y=x-d;if(!W[y]&&!W[y-d]&&!v[y]){v[y]=1;q.push(y)}}}return v};
+const R=(w,W,K,f,s,m)=>{let l=f;const t=[f];s[f]=m;while(t.length){const p=t.pop();if(p<l)l=p;for(const o of D){const q=p+o;if(!W[q]&&!K[q]&&s[q]!=m){s[q]=m;t.push(q)}}}return l};
+const F=(w,W,K,G,t)=>{for(const a of[t,t-1,t-w,t-w-1]){const b=a+1,c=a+w,d=c+1;if((W[a]||K[a])&&(W[b]||K[b])&&(W[c]||K[c])&&(W[d]||K[d])&&((K[a]&&!G[a])||(K[b]&&!G[b])||(K[c]&&!G[c])||(K[d]&&!G[d])))return 1}return 0};
+const Wk=(w,W,K,f,t)=>{if(f==t)return"";const pv=new Int32Array(W.length).fill(-1),H=[],q=[f];pv[f]=f;
+for(let i=0;i<q.length;i++){const p=q[i];if(p==t)break;for(let j=0;j<4;j++){const s=p+D[j];if(W[s]||K[s]||pv[s]!=-1)continue;pv[s]=p;H[s]=C[j];q.push(s)}}
+let s="";for(let p=t;p!=f;p=pv[p])s=H[p]+s;return s};
+const S=(w,W,G,B0,p0)=>{const n=W.length,g=new Uint8Array(n);for(const x of G)g[x]=1;
+const v=V(w,W,G);if(B0.some(b=>!v[b]))return null;
+const K=new Uint8Array(n),s=new Int32Array(n),k2=new Int32Array(n);let m=0;
+const key=(b,l)=>String.fromCharCode(l,...b),dn=b=>b.every(x=>g[x]);
+const B=[B0],Q=[p0],A=[-1],ix=new Map();
+for(const b of B0)K[b]=1;ix.set(key(B0,R(w,W,K,p0,s,++m)),0);for(const b of B0)K[b]=0;
+let f=dn(B0)?0:-1;
+for(let h=0;f<0&&h<B.length;h++){const bs=B[h];for(const b of bs)K[b]=1;R(w,W,K,Q[h],s,++m);const hr=m;
+for(let i=0;i<bs.length;i++){const b=bs[i];
+for(let j=0;j<4;j++){if(f>=0)break;const d=D[j],t=b+d;
+if(s[b-d]!=hr||W[t]||K[t]||!v[t])continue;
+K[b]=0;K[t]=1;let nx=null,kk="";
+if(!F(w,W,K,g,t)){nx=bs.slice();nx[i]=t;nx.sort((a,b)=>a-b);kk=key(nx,R(w,W,K,b,k2,++m))}
+K[t]=0;K[b]=1;
+if(!nx||ix.has(kk))continue;
+ix.set(kk,B.length);B.push(nx);Q.push(b);A.push(h);
+if(dn(nx))f=B.length-1}
+if(f>=0)break}
+for(const b of bs)K[b]=0}
+if(f<0)return null;
+const path=[];for(let x=f;x>0;x=A[x])path.push(x);path.reverse();
+let mv="",pl=p0,bs=B0;
+for(const x of path){const nb=B[x],fr=bs.find(b=>!nb.includes(b)),to=nb.find(b=>!bs.includes(b)),d=to-fr;
+for(const b of bs)K[b]=1;mv+=Wk(w,W,K,pl,fr-d);for(const b of bs)K[b]=0;
+mv+=C[D.indexOf(d)];pl=fr;bs=nb}
+return{m:mv,p:pl}};
+const RO=L=>{const{w,W,G,B,p}=L,n=W.length,v=V(w,W,G),row=(p/w)|0,cut=new Uint8Array(n);
+for(let i=row*w;i<(row+1)*w;i++)if(!W[i]&&!v[i])cut[i]=1;
+if(B.some(b=>cut[b]))return null;
+const part=new Int32Array(n).fill(-1),cs=[];
+for(let s=0;s<n;s++){if(W[s]||cut[s]||part[s]>=0)continue;
+const cells=[s];part[s]=cs.length;
+for(let i=0;i<cells.length;i++)for(let j=0;j<4;j++){const q=cells[i]+D[j];if(!W[q]&&!cut[q]&&part[q]<0){part[q]=cs.length;cells.push(q)}}
+cs.push({B:[],G:[]})}
+for(const b of B)cs[part[b]].B.push(b);
+for(const g of G){if(part[g]<0)return null;cs[part[g]].G.push(g)}
+if(cs.some(c=>c.B.length!=c.G.length))return null;
+return cs.filter(c=>c.B.length)};
+const SL=L=>{const rs=RO(L);if(!rs){const r=S(L.w,L.W,L.G,L.B,L.p);return r?r.m:""}
+let pl=L.p,mv="";const dn=rs.map(()=>0);
+for(let i=0;i<rs.length;i++){const W=L.W.slice();
+rs.forEach((o,j)=>{if(j!=i)for(const b of dn[j]?o.G:o.B)W[b]=1});
+const r=S(L.w,W,rs[i].G,rs[i].B,pl);if(!r)return"";mv+=r.m;pl=r.p;dn[i]=1}
+return mv};
+for(const id of readdirSync(I).sort()){const mv=SL(P(readFileSync(I+"/"+id+"/level.txt","utf8")));mkdirSync(O+"/"+id,{recursive:true});writeFileSync(O+"/"+id+"/solution.txt",mv+"\n")}
